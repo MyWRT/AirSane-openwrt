@@ -73,13 +73,51 @@ jobs:
       - name: Checkout current repository
         uses: actions/checkout@v4
 
+      - name: Install source hash dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+
       - name: Update Makefile with new release information
         id: update_makefile
         run: |
+          set -euo pipefail
+
           echo "::group::Retrieve parameters"
           tag=${{ needs.check_release_exists.outputs.tag }}
           release_date=${{ needs.check_release_exists.outputs.release_date }}
           commit_hash=${{ needs.check_release_exists.outputs.commit_hash }}
+          echo "::endgroup::"
+
+          echo "::group::Calculate PKG_MIRROR_HASH"
+          pkg_name=$(sed -n "s/^PKG_NAME:=//p" airsaned/Makefile)
+          pkg_version=${tag#v}
+          source_url=$(sed -n "s/^PKG_SOURCE_URL:=//p" airsaned/Makefile)
+          source_subdir="${pkg_name}-${pkg_version}"
+          source_archive="${source_subdir}.tar.zst"
+          tmpdir=$(mktemp -d)
+          trap 'rm -rf "${tmpdir}"' EXIT
+
+          git clone "${source_url}" "${tmpdir}/${source_subdir}.git"
+          git -C "${tmpdir}/${source_subdir}.git" checkout "${commit_hash}"
+
+          tar_timestamp=$(git -C "${tmpdir}/${source_subdir}.git" log -1 --no-show-signature --format='@%ct')
+          git -C "${tmpdir}/${source_subdir}.git" config core.abbrev 8
+          git -C "${tmpdir}/${source_subdir}.git" archive --format=tar HEAD --output="${tmpdir}/${source_subdir}.tar.git"
+          tar --numeric-owner --owner=0 --group=0 --ignore-failed-read \
+            -C "${tmpdir}/${source_subdir}.git" -f "${tmpdir}/${source_subdir}.tar.git" \
+            -r .git .gitmodules 2>/dev/null
+
+          mkdir "${tmpdir}/${source_subdir}"
+          tar -C "${tmpdir}/${source_subdir}" -xf "${tmpdir}/${source_subdir}.tar.git"
+          git -C "${tmpdir}/${source_subdir}" submodule update --init --recursive --
+          rm -rf "${tmpdir}/${source_subdir}/.git" "${tmpdir}/${source_subdir}/.gitmodules"
+
+          tar --numeric-owner --owner=0 --group=0 --mode=a-s --sort=name \
+            --mtime="${tar_timestamp}" -C "${tmpdir}" -c "${source_subdir}" \
+            | zstd -T0 --ultra -20 -c > "${tmpdir}/${source_archive}"
+          mirror_hash=$(sha256sum "${tmpdir}/${source_archive}" | cut -d ' ' -f1)
+          echo "PKG_MIRROR_HASH=${mirror_hash}"
           echo "::endgroup::"
 
           echo "::group::Replace values in Makefile"
@@ -87,7 +125,7 @@ jobs:
           sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${tag#v}/" airsaned/Makefile
           sed -i "s/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=${commit_hash}/" airsaned/Makefile
           sed -i "s/^PKG_SOURCE_DATE:=.*/PKG_SOURCE_DATE:=${release_date}/" airsaned/Makefile
-          sed -i "s/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/" airsaned/Makefile
+          sed -i "s/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=${mirror_hash}/" airsaned/Makefile
           echo "::endgroup::"
 
       - name: Check for changes
@@ -132,7 +170,7 @@ jobs:
             cp -v $(find "$pkd" -name '*.ipk' -type f) release-packages/${pkd%.d}
           done
       - name: Create new release from tag
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.check_release_exists.outputs.tag }}
           name: ${{ needs.check_release_exists.outputs.release_title }}
